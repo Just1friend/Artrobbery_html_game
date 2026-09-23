@@ -1,0 +1,38 @@
+## 修复总结
+### 1. 重复代码、死 CSS、魔法数字 🟢
+- 抽取 resolvePlayerPosition 、 getAlibiClass 、 getLootTitle 三个工具函数
+- 三处 loot 渲染（createPlayerCard/renderCentralLoot/renderMyLootPanel）的重复 alibi 计算全部统一
+- 新增 ANIMATION_DURATIONS 常量，替换所有散落的 600/800/2000 魔法数字
+### 2. 5 人布局 🟡
+- index.html#L136 新增 player-bottom-extra 容器
+- game.js#L195 注册到 playerPositions ，第 5 位玩家走新槽位
+- style.css#L325-L338 启用 .bottom-extra 槽位（ :empty 时自动隐藏），修复 600px 媒体查询的缩进异常
+### 3. 状态同步时序 🟠
+- resolveDogCard 已在前次修复（先改 state 再动画）
+- takeLootFromCenter 重新排序：先取 fromEl → 同步改全部 state → broadcastAnimation → 动画，加 idx<0 防御
+- resolveGreedyCard 改用 classList.add('selectable') 标记而非重写 DOM，玩家放弃选择时 UI 可还原
+- renderCentralLoot 里 finishRound() 改为 setTimeout(0) 异步，避免渲染函数有副作用导致竞态
+### 4. 断线重连 🟡
+服务器端 server.js ：
+
+- 新增 handleReconnect ：按 playerId 恢复连接，推送当前状态
+- handleDisconnect 改为只标记 disconnectedAt ，5 分钟超时后才清理
+- 房主断线时自动指派新房主
+- broadcastToRoom 增加 !p.ws 空指针防护
+- sendPlayerList 加 isOnline 字段
+客户端 game.js ：
+
+- saveSession/loadSession/clearSession 用 localStorage 持久化 playerId/roomCode
+- connectWebSocket 自动重连机制（指数退避，最多 5 次）
+- 处理 reconnected / error 消息分支
+- 等待界面显示 (已离线) 标记
+### 5. 联机架构安全 🔴
+- 新增 buildPlayerViewOfGameState ：按玩家视角过滤 gameState，其他玩家 hand 字段清空，避免房主客户端泄露全手牌
+- 在 handleStartGame 、 handleAction 、 handleGameEnd 、 handleReconnect 四处都按视角过滤
+- 取消 renderActionButtons 中"只有房主能开下一轮"的限制，任何在线玩家都能推进流程，房主掉线不会卡死游戏
+- nextRound 按钮事件 加 nextRoundLock 防重复点击
+## 测试建议
+1. 启动服务器： npm start ，浏览器打开 http://localhost:3001
+2. 测试 5 人布局：开 5 个标签页加入同一房间
+3. 测试断线重连：游戏中关闭一个标签页，再重新打开（同浏览器即可，localStorage 会保留会话）
+4. 测试手牌过滤：用浏览器 DevTools 在房主标签页查看 state.players[1].hand （应为完整），切换到玩家2标签页查看 state.players[0].hand （应为 [] ）

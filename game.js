@@ -29,6 +29,43 @@ const ROUND_NAMES = ['素描', '雕塑', '绘画', '文物'];
 // 数字牌emoji映射
 const NUMBER_EMOJIS = ['0️⃣', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
 
+// 动画时长（毫秒），集中管理避免散落
+const ANIMATION_DURATIONS = {
+  loot: 600,
+  dog: 800,
+  emoji: 2000
+};
+
+// 玩家位置槽位（顺时针：下 -> 左 -> 上 -> 右 -> 下-扩展）
+const PLAYER_POSITIONS_4 = ['bottom', 'left', 'top', 'right'];
+const PLAYER_POSITIONS_5 = ['bottom', 'left', 'top', 'right', 'bottom-extra'];
+
+// 根据玩家数与相对索引解析位置槽名
+function resolvePlayerPosition(playerCount, relativeIndex) {
+  if (relativeIndex === 0) return 'bottom';
+  if (playerCount === 2) return 'top';
+  if (playerCount === 3) return relativeIndex === 1 ? 'left' : 'right';
+  if (playerCount === 4) return PLAYER_POSITIONS_4[relativeIndex];
+  // 5 人：第 5 个玩家进入 bottom-extra 槽
+  return PLAYER_POSITIONS_5[relativeIndex];
+}
+
+// 根据赃物 alibiCount 返回对应的 CSS 类
+function getAlibiClass(loot) {
+  if (!loot || !loot.alibi) return '';
+  return loot.alibiCount >= 2 ? 'alibi-double' : 'alibi';
+}
+
+// 根据赃物生成提示文字
+function getLootTitle(loot) {
+  if (!loot) return '';
+  let text = loot.isBoss ? '老板指示物' : `赃物 ${loot.value}`;
+  if (loot.alibi && loot.alibiCount > 0) {
+    text += ` (${loot.alibiCount}个白点)`;
+  }
+  return text;
+}
+
 // 赃物配置：每轮都有 0,1,2,3,3,3,4,5 加上老板
 // 白点分布规则：
 // 第1轮：0有2个白点，其他没有，老板没有
@@ -154,7 +191,8 @@ const gameEls = {
     top: document.getElementById('player-top'),
     left: document.getElementById('player-left'),
     right: document.getElementById('player-right'),
-    bottom: document.getElementById('player-bottom')
+    bottom: document.getElementById('player-bottom'),
+    'bottom-extra': document.getElementById('player-bottom-extra')
   },
   emojiPanel: document.getElementById('emoji-panel')
 };
@@ -168,28 +206,83 @@ const dialogEls = {
 };
 
 // ==================== WebSocket 联机功能 ====================
+// 持久化 playerId，便于断线后重连
+function saveSession() {
+  try {
+    localStorage.setItem('art_robbery_session', JSON.stringify({
+      roomCode: state.roomCode,
+      playerId: state.myPlayerId
+    }));
+  } catch (e) { /* localStorage 不可用时静默失败 */ }
+}
+
+function loadSession() {
+  try {
+    const raw = localStorage.getItem('art_robbery_session');
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) { return null; }
+}
+
+function clearSession() {
+  try { localStorage.removeItem('art_robbery_session'); } catch (e) {}
+}
+
+// 自动重连控制：避免无限重连
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
+// 区分「用户主动连接」与「断线后自动重连」
+// 关键修复：用户主动点"远程联机"打开新标签页时，不能自动用 localStorage 里的旧 session
+// 重连，否则会把第二个标签页错误绑定到第一个玩家的身份
+let isAutoReconnecting = false;
+
 function connectWebSocket() {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${protocol}//${window.location.host}`;
-  
+
   try {
     state.ws = new WebSocket(wsUrl);
-    
+
     state.ws.onopen = () => {
+      reconnectAttempts = 0;
       lobbyEls.status.textContent = '已连接';
       lobbyEls.status.classList.add('connected');
+
+      // 只在「断线后自动重连」时尝试恢复 session，
+      // 用户主动新开标签页连接时不自动重连，避免身份冲突
+      if (isAutoReconnecting) {
+        const session = loadSession();
+        if (session && session.roomCode && session.playerId) {
+          sendToServer('reconnect', {
+            roomCode: session.roomCode,
+            playerId: session.playerId
+          });
+        }
+        isAutoReconnecting = false;
+      }
     };
-    
+
     state.ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
       handleServerMessage(data);
     };
-    
+
     state.ws.onclose = () => {
       lobbyEls.status.textContent = '连接已断开';
       lobbyEls.status.classList.remove('connected');
+
+      // 关键：游戏进行中意外断线时尝试重连，最多 MAX_RECONNECT_ATTEMPTS 次
+      if (state.isOnline && state.myPlayerId && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+        reconnectAttempts++;
+        const delay = Math.min(1000 * reconnectAttempts, 5000);
+        // 标记为自动重连，onopen 时据此判断是否要恢复 session
+        isAutoReconnecting = true;
+        setTimeout(() => {
+          if (state.isOnline) connectWebSocket();
+        }, delay);
+      }
     };
-    
+
     state.ws.onerror = (err) => {
       lobbyEls.status.textContent = '连接错误，请检查服务器';
       console.error('WebSocket error:', err);
@@ -198,6 +291,18 @@ function connectWebSocket() {
   } catch (e) {
     showToast('WebSocket 不支持，将使用本地模式');
   }
+}
+
+// 用户主动发起重连（点 lobby 上的"重连上次房间"按钮）
+function manualReconnect() {
+  const session = loadSession();
+  if (!session || !session.roomCode || !session.playerId) {
+    showToast('没有可恢复的游戏会话');
+    return;
+  }
+  state.isOnline = true;
+  isAutoReconnecting = true;
+  connectWebSocket();
 }
 
 function sendToServer(type, data) {
@@ -212,13 +317,39 @@ function handleServerMessage(data) {
       state.roomCode = data.roomCode;
       state.myPlayerId = data.playerId;
       state.isHost = true;
+      saveSession();
       showWaitingScreen();
       break;
     case 'joinedRoom':
       state.roomCode = data.roomCode;
       state.myPlayerId = data.playerId;
       state.isHost = false;
+      saveSession();
       showWaitingScreen();
+      break;
+    case 'reconnected':
+      // 关键：断线重连成功，恢复玩家身份并拉取最新状态
+      state.roomCode = data.roomCode;
+      state.myPlayerId = data.playerId;
+      state.myPlayerIndex = data.myPlayerIndex;
+      state.isOnline = true;
+      reconnectAttempts = 0;
+      if (data.gameState) {
+        syncGameState(data.gameState);
+        showScreen('game');
+        showToast('已重新连接到房间');
+      } else {
+        showWaitingScreen();
+      }
+      break;
+    case 'error':
+      // 服务器返回错误（房间已关闭、玩家身份失效等）
+      showToast(data.message || '操作失败');
+      clearSession();
+      state.isOnline = false;
+      state.myPlayerId = null;
+      state.roomCode = null;
+      showScreen('lobby');
       break;
     case 'playerList':
       updateWaitingPlayers(data.players);
@@ -252,6 +383,7 @@ function handleServerMessage(data) {
       // 关键修复：接收游戏结束消息
       syncGameState(data.gameState);
       showFinalResult();
+      clearSession();
       break;
     case 'emoji':
       // Emoji表情消息
@@ -308,6 +440,8 @@ waitingEls.leaveBtn.addEventListener('click', () => {
   state.isOnline = false;
   state.isHost = false;
   state.roomCode = null;
+  state.myPlayerId = null;
+  clearSession();
   showScreen('lobby');
 });
 
@@ -326,10 +460,11 @@ function updateWaitingPlayers(players) {
   players.forEach(p => {
     const div = document.createElement('div');
     div.className = 'waiting-player' + (p.id === state.myPlayerId ? ' is-you' : '');
-    div.textContent = p.name + (p.id === state.myPlayerId ? ' (你)' : '');
+    const onlineLabel = p.isOnline === false ? ' (已离线)' : '';
+    div.textContent = p.name + (p.id === state.myPlayerId ? ' (你)' : onlineLabel);
     waitingEls.playerList.appendChild(div);
   });
-  
+
   if (state.isHost) {
     waitingEls.startBtn.disabled = players.length < 2 || players.length > 5;
     waitingEls.startBtn.textContent = `开始游戏 (${players.length}人)`;
@@ -503,46 +638,20 @@ function updateUI() {
   renderActionButtons();
 }
 
-// 顺时针布局：下 -> 左 -> 上 -> 右
+// 顺时针布局：下 -> 左 -> 上 -> 右 -> 下-扩展（5人）
 function renderCircularPlayers() {
   const playerCount = state.players.length;
-  
+
   Object.values(gameEls.playerPositions).forEach(el => el.innerHTML = '');
-  
+
   const myIndex = state.myPlayerIndex >= 0 ? state.myPlayerIndex : 0;
-  
+
   for (let i = 0; i < playerCount; i++) {
     const player = state.players[i];
     const relativeIndex = (i - myIndex + playerCount) % playerCount;
-    
-    let position;
-    if (relativeIndex === 0) {
-      position = 'bottom';
-    } else if (playerCount === 2) {
-      position = 'top';
-    } else if (playerCount === 3) {
-      // 顺时针：下、左、右
-      position = relativeIndex === 1 ? 'left' : 'right';
-    } else if (playerCount === 4) {
-      // 顺时针：下、左、上、右
-      position = ['bottom', 'left', 'top', 'right'][relativeIndex];
-    } else {
-      // 5人顺时针：下、左、上、右、下-extra
-      if (relativeIndex === 4) {
-        position = 'bottom';
-        // 为第5个玩家创建特殊样式
-      } else {
-        position = ['bottom', 'left', 'top', 'right'][relativeIndex];
-      }
-    }
-    
+    const position = resolvePlayerPosition(playerCount, relativeIndex);
+
     const card = createPlayerCard(player, i, relativeIndex === 0);
-    
-    // 5人时第5个玩家放在bottom位置但用flex并排
-    if (playerCount === 5 && relativeIndex === 4) {
-      card.style.marginLeft = '15px';
-    }
-    
     gameEls.playerPositions[position].appendChild(card);
   }
 }
@@ -552,24 +661,7 @@ function getPlayerPositionElement(playerIndex) {
   const playerCount = state.players.length;
   const myIndex = state.myPlayerIndex >= 0 ? state.myPlayerIndex : 0;
   const relativeIndex = (playerIndex - myIndex + playerCount) % playerCount;
-
-  let position;
-  if (relativeIndex === 0) {
-    position = 'bottom';
-  } else if (playerCount === 2) {
-    position = 'top';
-  } else if (playerCount === 3) {
-    position = relativeIndex === 1 ? 'left' : 'right';
-  } else if (playerCount === 4) {
-    position = ['bottom', 'left', 'top', 'right'][relativeIndex];
-  } else {
-    if (relativeIndex === 4) {
-      position = 'bottom';
-    } else {
-      position = ['bottom', 'left', 'top', 'right'][relativeIndex];
-    }
-  }
-
+  const position = resolvePlayerPosition(playerCount, relativeIndex);
   return gameEls.playerPositions[position];
 }
 
@@ -622,7 +714,7 @@ function createPlayerCard(player, index, isMe) {
   const alibiCount = showAlibi ? countAlibi(player) : '?';
   
   stats.innerHTML = `
-    <span>手牌<span class="stat-value">${player.cardCount || player.hand.length}</span></span>
+    <span>手牌<span class="stat-value">${player.handCount ?? player.cardCount ?? player.hand.length}</span></span>
     <span>本轮<span class="stat-value">${player.lootThisRound.length}</span></span>
     ${showAlibi ? `<span>白点<span class="stat-value">${alibiCount}</span></span>` : ''}
   `;
@@ -634,25 +726,15 @@ function createPlayerCard(player, index, isMe) {
     lootDiv.className = 'player-round-loot';
     player.lootThisRound.forEach(loot => {
       const chip = document.createElement('span');
-      // 关键修复：根据alibiCount显示两个白点
-      const alibiClass = loot.alibi 
-        ? (loot.alibiCount >= 2 ? ' alibi-double' : ' alibi')
-        : '';
+      const alibiClass = getAlibiClass(loot) ? ' ' + getAlibiClass(loot) : '';
       chip.className = 'loot-chip' + (loot.isBoss ? ' boss' : '') + alibiClass;
       chip.textContent = loot.isBoss ? '5' : loot.value;
-
-      // 构建提示文字
-      let titleText = loot.isBoss ? '老板指示物' : `赃物 ${loot.value}`;
-      if (loot.alibi && loot.alibiCount > 0) {
-        titleText += ` (${loot.alibiCount}个白点)`;
-      }
-      chip.title = titleText;
-
+      chip.title = getLootTitle(loot);
       lootDiv.appendChild(chip);
     });
     div.appendChild(lootDiv);
   }
-  
+
   return div;
 }
 
@@ -669,23 +751,20 @@ function countAlibi(player) {
 
 function renderCentralLoot() {
   gameEls.centralLoot.innerHTML = '';
-  
+
   if (state.centralLoot.length === 0 && !state.roundFinished) {
     gameEls.roundBanner.classList.remove('hidden');
-    finishRound();
+    // 异步触发，避免在渲染过程中修改 state 导致竞态
+    setTimeout(finishRound, 0);
     return;
   }
-  
+
   state.centralLoot.forEach(loot => {
     const div = document.createElement('div');
-    // 关键修复：根据alibiCount显示两个白点
-    const alibiClass = loot.alibi 
-      ? (loot.alibiCount >= 2 ? ' alibi-double' : ' alibi')
-      : '';
+    const alibiClass = getAlibiClass(loot) ? ' ' + getAlibiClass(loot) : '';
     div.className = 'loot-token' + (loot.isBoss ? ' boss' : '') + alibiClass;
     div.textContent = loot.isBoss ? '5' : loot.value;
-    const alibiText = loot.alibi ? ` (${loot.alibiCount}个白点)` : '';
-    div.title = loot.isBoss ? '老板指示物 (5分)' : `赃物 ${loot.value}${alibiText}`;
+    div.title = getLootTitle(loot);
     div.dataset.id = loot.id;
     gameEls.centralLoot.appendChild(div);
   });
@@ -744,7 +823,8 @@ function renderMyHand() {
     gameEls.handCards.appendChild(btn);
   });
   
-  if (current.hand.length < 5) {
+  // 关键修复：只在牌堆真的抽空时才提示，手牌<5 但牌堆有牌属于正常状态
+  if (current.hand.length < 5 && state.deck.length === 0) {
     const notice = document.createElement('div');
     notice.className = 'card-count-notice';
     notice.textContent = `牌堆已耗尽，剩余 ${current.hand.length} 张牌`;
@@ -764,15 +844,11 @@ function renderActionButtons() {
     gameEls.nextPlayerBtn.classList.add('hidden');
   }
   
-  // 下一轮按钮
+  // 下一轮按钮：关键修复，取消「只有房主能开下一轮」的限制，
+  // 任何在线玩家都可以推进流程，避免房主掉线导致游戏卡死
   if (state.roundFinished && !state.gameFinished) {
-    const canStartNext = !state.isOnline || state.isHost;
-    if (canStartNext) {
-      gameEls.nextRoundBtn.classList.remove('hidden');
-      gameEls.nextRoundBtn.disabled = false;
-    } else {
-      gameEls.nextRoundBtn.classList.add('hidden');
-    }
+    gameEls.nextRoundBtn.classList.remove('hidden');
+    gameEls.nextRoundBtn.disabled = false;
   } else {
     gameEls.nextRoundBtn.classList.add('hidden');
   }
@@ -811,20 +887,10 @@ function renderMyLootPanel() {
     items.className = 'player-round-loot';
     lootByRound[round].forEach(loot => {
       const chip = document.createElement('span');
-      // 关键修复：根据alibiCount显示两个白点
-      const alibiClass = loot.alibi 
-        ? (loot.alibiCount >= 2 ? ' alibi-double' : ' alibi')
-        : '';
+      const alibiClass = getAlibiClass(loot) ? ' ' + getAlibiClass(loot) : '';
       chip.className = 'loot-chip' + (loot.isBoss ? ' boss' : '') + alibiClass;
       chip.textContent = loot.isBoss ? '5' : loot.value;
-
-      // 构建提示文字
-      let titleText = loot.isBoss ? '老板指示物' : `赃物 ${loot.value}`;
-      if (loot.alibi && loot.alibiCount > 0) {
-        titleText += ` (${loot.alibiCount}个白点)`;
-      }
-      chip.title = titleText;
-
+      chip.title = getLootTitle(loot);
       items.appendChild(chip);
     });
     group.appendChild(items);
@@ -1019,20 +1085,22 @@ function resolveBossCard(playerIndex, done) {
 
 function resolveDogCard(playerIndex) {
   const player = state.players[playerIndex];
-  
+
   if (state.dogInCenter) {
+    // 关键修复：先更新状态，再执行动画，确保状态同步给服务器时已正确
+    state.dogInCenter = false;
+    state.dogOwner = playerIndex;
+    logAction(`${player.name} 牵走了守卫犬`);
+    broadcastLog(`${player.name} 牵走了守卫犬`);
+
     // 狗在中央，飞行动画到玩家
     const fromEl = document.getElementById('dog-token');
     const toEl = getPlayerPositionElement(playerIndex).querySelector('.player-card');
-    
+
     animateDogMove(fromEl, toEl, function() {
-      state.dogInCenter = false;
-      state.dogOwner = playerIndex;
-      logAction(`${player.name} 牵走了守卫犬`);
-      broadcastLog(`${player.name} 牵走了守卫犬`);
       updateUI();
     });
-    
+
     // 广播狗的飞行动画
     broadcastAnimation({
       type: 'dogMove',
@@ -1040,23 +1108,26 @@ function resolveDogCard(playerIndex) {
       toPlayerIndex: playerIndex
     });
   } else if (state.dogOwner !== null && state.dogOwner !== playerIndex) {
-    const oldOwner = state.players[state.dogOwner];
-    
+    // 关键修复：先保存旧主人索引，再更新状态，最后用旧索引做动画
+    const oldOwnerIndex = state.dogOwner;
+    const oldOwner = state.players[oldOwnerIndex];
+
+    state.dogOwner = playerIndex;
+    logAction(`${player.name} 从 ${oldOwner.name} 那里骗来了守卫犬`);
+    broadcastLog(`${player.name} 从 ${oldOwner.name} 那里骗来了守卫犬`);
+
     // 狗从别人那里飞过来
-    const fromEl = getPlayerPositionElement(state.dogOwner).querySelector('.player-card');
+    const fromEl = getPlayerPositionElement(oldOwnerIndex).querySelector('.player-card');
     const toEl = getPlayerPositionElement(playerIndex).querySelector('.player-card');
-    
+
     animateDogMove(fromEl, toEl, function() {
-      state.dogOwner = playerIndex;
-      logAction(`${player.name} 从 ${oldOwner.name} 那里骗来了守卫犬`);
-      broadcastLog(`${player.name} 从 ${oldOwner.name} 那里骗来了守卫犬`);
       updateUI();
     });
-    
+
     // 广播狗的飞行动画
     broadcastAnimation({
       type: 'dogMove',
-      fromPlayerIndex: state.dogOwner,
+      fromPlayerIndex: oldOwnerIndex,
       toPlayerIndex: playerIndex
     });
   } else if (state.dogOwner === null) {
@@ -1086,27 +1157,27 @@ function animateDogMove(fromEl, toEl, onDone) {
   token.style.position = 'fixed';
   token.style.zIndex = '100';
   token.style.pointerEvents = 'none';
-  token.style.transition = 'transform 0.8s cubic-bezier(0.25, 0.46, 0.45, 0.94), opacity 0.8s ease-out';
-  
+  token.style.transition = `transform ${ANIMATION_DURATIONS.dog}ms cubic-bezier(0.25, 0.46, 0.45, 0.94), opacity ${ANIMATION_DURATIONS.dog}ms ease-out`;
+
   document.body.appendChild(token);
-  
+
   const startX = fromRect.left + fromRect.width / 2;
   const startY = fromRect.top + fromRect.height / 2;
   const endX = toRect.left + toRect.width / 2;
   const endY = toRect.top + toRect.height / 2;
-  
+
   token.style.left = startX + 'px';
   token.style.top = startY + 'px';
   token.style.transform = 'translate(-50%, -50%)';
-  
+
   // 强制重绘
   token.getBoundingClientRect();
-  
+
   const dx = endX - startX;
   const dy = endY - startY;
   token.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
   token.style.opacity = '0';
-  
+
   setTimeout(function() {
     if (token && token.parentNode) {
       token.parentNode.removeChild(token);
@@ -1114,77 +1185,80 @@ function animateDogMove(fromEl, toEl, onDone) {
     if (typeof onDone === 'function') {
       onDone();
     }
-  }, 800);
+  }, ANIMATION_DURATIONS.dog);
 }
 
 function resolveGreedyCard(playerIndex, done) {
   const player = state.players[playerIndex];
-  // 关键修复：确保贪心贼不能拿老板牌
   const available = state.centralLoot.filter(l => !l.isBoss);
-  
+
   if (available.length === 0) {
     logAction(`${player.name} 打出贪心贼，但中央已无赃物`);
     broadcastLog(`${player.name} 打出贪心贼，但中央已无赃物`);
     done && done();
     return;
   }
-  
+
   logAction(`${player.name} 打出贪心贼，请选择中央赃物`);
   broadcastLog(`${player.name} 打出贪心贼，请选择中央赃物`);
-  
-  // 关键修复：只渲染非老板赃物，确保不能点击老板牌
-  gameEls.centralLoot.innerHTML = '';
-  available.forEach(loot => {
-    const div = document.createElement('div');
-    div.className = 'loot-token selectable' + (loot.alibi ? ' alibi' : '');
-    div.textContent = loot.value;
-    div.dataset.id = loot.id;
-    div.addEventListener('click', () => {
-      // 双重检查：确保不能拿老板牌
-      if (loot.isBoss) {
-        showToast('贪心贼不能拿老板牌！');
-        return;
-      }
-      takeLootFromCenter(loot, playerIndex, function () {
-        logAction(`${player.name} 用贪心贼拿走赃物 ${loot.value}`);
-        broadcastLog(`${player.name} 用贪心贼拿走赃物 ${loot.value}`);
-        updateUI();
-        done && done();
+
+  // 标记可选状态（不改 centralLoot 数据，只加 CSS 类）
+  // 这样如果玩家不选择直接退出，UI 也能正确还原
+  const selectableTokens = [];
+  state.centralLoot.forEach(loot => {
+    if (loot.isBoss) return; // 老板牌不可选
+    const el = gameEls.centralLoot.querySelector('[data-id="' + loot.id + '"]');
+    if (el) {
+      el.classList.add('selectable');
+      selectableTokens.push({ el, loot });
+      el.addEventListener('click', function handler() {
+        el.removeEventListener('click', handler);
+        // 清除所有可选标记
+        selectableTokens.forEach(s => s.el.classList.remove('selectable'));
+        takeLootFromCenter(loot, playerIndex, function () {
+          logAction(`${player.name} 用贪心贼拿走赃物 ${loot.value}`);
+          broadcastLog(`${player.name} 用贪心贼拿走赃物 ${loot.value}`);
+          updateUI();
+          done && done();
+        });
       });
-    });
-    gameEls.centralLoot.appendChild(div);
+    }
   });
 }
 
 function takeLootFromCenter(loot, playerIndex, onDone) {
   const idx = state.centralLoot.findIndex(l => l.id === loot.id);
-  if (idx >= 0) {
-    const fromEl = gameEls.centralLoot.querySelector('[data-id="' + loot.id + '"]');
-    const toEl = getPlayerPositionElement(playerIndex).querySelector('.player-card');
-    
-    // 关键修复：先移除赃物，再执行动画
-    state.centralLoot.splice(idx, 1);
-    
-    // 广播飞行动画给所有玩家
-    broadcastAnimation({
-      type: 'centerToPlayer',
-      lootId: loot.id,
-      fromPlayerIndex: -1, // 中央
-      toPlayerIndex: playerIndex,
-      loot: loot
-    });
-    
-    // 本地执行动画
-    animateLootMove(fromEl, toEl, loot.isBoss, loot.alibi, loot.value, null, function () {
-      if (typeof onDone === 'function') onDone();
-    });
+  if (idx < 0) {
+    // 已被移除（防御性处理）
+    if (typeof onDone === 'function') onDone();
+    return;
   }
-  
+
+  // 关键：先记录 fromEl（基于当前 DOM），再同步更新所有 state
+  const fromEl = gameEls.centralLoot.querySelector('[data-id="' + loot.id + '"]');
+  const toEl = getPlayerPositionElement(playerIndex).querySelector('.player-card');
+
+  // 同步更新全部状态：移除中央赃物 + 玩家获得 + 老板归属
+  state.centralLoot.splice(idx, 1);
   const player = state.players[playerIndex];
   player.lootThisRound.push(loot);
   if (loot.isBoss) {
     state.bossOwner = playerIndex;
   }
+
+  // 状态已全部更新，再广播动画指令给其他玩家
+  broadcastAnimation({
+    type: 'centerToPlayer',
+    lootId: loot.id,
+    fromPlayerIndex: -1, // 中央
+    toPlayerIndex: playerIndex,
+    loot: loot
+  });
+
+  // 本地执行飞行动画（视觉层，不影响状态）
+  animateLootMove(fromEl, toEl, loot.isBoss, loot.alibi, loot.value, null, function () {
+    if (typeof onDone === 'function') onDone();
+  });
 }
 
 function robFromPlayer(attackerIndex, victimIndex, value, onDone) {
@@ -1448,6 +1522,25 @@ function showFinalResult() {
     onClick: () => {
       closeDialog();
       if (state.ws) state.ws.close();
+      // 关键修复：清空游戏状态，避免下一局残留上一局的赃物/分数
+      state.players = [];
+      state.deck = [];
+      state.discardPile = [];
+      state.centralLoot = [];
+      state.bossOwner = null;
+      state.dogOwner = null;
+      state.dogInCenter = false;
+      state.currentPlayerIndex = 0;
+      state.roundIndex = 0;
+      state.roundFinished = false;
+      state.gameFinished = false;
+      state.actionHistory = [];
+      state.roomCode = null;
+      state.myPlayerId = null;
+      state.myPlayerIndex = -1;
+      state.isHost = false;
+      state.isOnline = false;
+      clearSession();
       showScreen('mode');
     }
   }]);
@@ -1601,33 +1694,39 @@ function animateLootMove(fromEl, toEl, isBoss, hasAlibi, value, label, onDone) {
     if (typeof onDone === 'function') {
       onDone();
     }
-  }, 600);
+  }, ANIMATION_DURATIONS.loot);
 }
 
 // ==================== 下一轮按钮 ====================
+// 关键修复：任何在线玩家点击「下一轮」都能推进流程，
+// 由服务器权威 gameState 同步保证一致性
+let nextRoundLock = false; // 防止重复点击
 gameEls.nextRoundBtn.addEventListener('click', () => {
   if (!state.roundFinished || state.gameFinished) return;
-  
+  if (nextRoundLock) return;
+  nextRoundLock = true;
+  setTimeout(() => { nextRoundLock = false; }, 1000);
+
   state.roundIndex++;
   state.currentPlayerIndex = 0;
   state.roundFinished = false;
-  
-  // 关键修复：确保隐藏本轮结束提示
+
   if (gameEls.roundBanner) {
     gameEls.roundBanner.classList.add('hidden');
   }
-  
+
   if (state.roundIndex <= 3) {
     startRound();
-    
-    if (state.isOnline && state.isHost) {
+
+    // 关键修复：任何在线玩家都能发 nextRound action（之前仅 isHost）
+    if (state.isOnline) {
       sendToServer('action', {
         roomCode: state.roomCode,
         action: 'nextRound',
         gameState: getGameStateForSync()
       });
     }
-    
+
     updateUI();
   }
 });
@@ -1869,12 +1968,11 @@ function showEmojiBubble(playerIndex, emoji) {
   
   document.body.appendChild(bubble);
   
-  // 2秒后移除
   setTimeout(() => {
     if (bubble.parentNode) {
       bubble.parentNode.removeChild(bubble);
     }
-  }, 2000);
+  }, ANIMATION_DURATIONS.emoji);
 }
 
 // ==================== 初始化 ====================

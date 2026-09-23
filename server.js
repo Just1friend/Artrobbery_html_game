@@ -195,8 +195,10 @@ function createGameState(playerNames) {
 function broadcastToRoom(roomCode, message, excludeWs = null) {
   const room = rooms.get(roomCode);
   if (!room) return;
-  
+
   room.players.forEach(p => {
+    // 断线玩家 p.ws 为 null，跳过避免空指针
+    if (!p.ws) return;
     if (p.ws !== excludeWs && p.ws.readyState === WebSocket.OPEN) {
       p.ws.send(JSON.stringify(message));
     }
@@ -206,12 +208,13 @@ function broadcastToRoom(roomCode, message, excludeWs = null) {
 function sendPlayerList(roomCode) {
   const room = rooms.get(roomCode);
   if (!room) return;
-  
+
   const playerList = room.players.map(p => ({
     id: p.id,
-    name: p.name
+    name: p.name,
+    isOnline: !!p.ws && p.ws.readyState === WebSocket.OPEN
   }));
-  
+
   broadcastToRoom(roomCode, {
     type: 'playerList',
     players: playerList
@@ -245,35 +248,39 @@ function handleMessage(ws, msg) {
     case 'createRoom':
       handleCreateRoom(ws, msg);
       break;
-      
+
     case 'joinRoom':
       handleJoinRoom(ws, msg);
       break;
-      
+
     case 'startGame':
       handleStartGame(ws, msg);
       break;
-      
+
+    case 'reconnect':
+      handleReconnect(ws, msg);
+      break;
+
     case 'action':
       handleAction(ws, msg);
       break;
-      
+
     case 'animation':
       handleAnimation(ws, msg);
       break;
-      
+
     case 'log':
       handleLog(ws, msg);
       break;
-      
+
     case 'dogDefense':
       handleDogDefense(ws, msg);
       break;
-      
+
     case 'gameEnd':
       handleGameEnd(ws, msg);
       break;
-      
+
     case 'emoji':
       handleEmoji(ws, msg);
       break;
@@ -369,14 +376,14 @@ function handleStartGame(ws, msg) {
   room.players.forEach((p, idx) => {
     room.gameState.players[idx].id = p.id;
   });
-  
-  // 发送游戏开始消息给所有玩家
+
+  // 关键修复：发送游戏开始消息时按玩家视角过滤，避免泄露其他玩家手牌
   room.players.forEach((p, idx) => {
-    if (p.ws.readyState === WebSocket.OPEN) {
+    if (p.ws && p.ws.readyState === WebSocket.OPEN) {
       p.ws.send(JSON.stringify({
         type: 'gameStarted',
         gameState: {
-          ...room.gameState,
+          ...buildPlayerViewOfGameState(room.gameState, idx),
           myPlayerIndex: idx
         }
       }));
@@ -386,21 +393,58 @@ function handleStartGame(ws, msg) {
   console.log(`Game started in room ${msg.roomCode} with ${room.players.length} players`);
 }
 
+// 关键修复：构造按玩家视角过滤的 gameState
+// 其他玩家的手牌字段被清空，仅保留自己手牌，避免房主客户端泄露全手牌信息
+function buildPlayerViewOfGameState(gameState, playerIndex) {
+  if (!gameState) return null;
+  // 浅拷贝 + players 数组单独处理，避免深拷贝开销
+  const view = { ...gameState };
+  view.players = gameState.players.map((p, i) => {
+    if (i === playerIndex) return { ...p, handCount: p.hand ? p.hand.length : 0 }; // 自己保留完整数据（含手牌）
+    // 其他玩家隐藏手牌内容，但保留手牌数量供 UI 显示
+    return {
+      ...p,
+      hand: [],
+      handCount: p.hand ? p.hand.length : 0
+    };
+  });
+  return view;
+}
+
 function handleAction(ws, msg) {
   const room = rooms.get(msg.roomCode);
-  if (!room || !room.gameState) return;
-  
-  // 更新游戏状态
+  if (!room) return;
+
+  const conn = playerConnections.get(ws);
+  if (!conn) return;
+  const senderIndex = conn.playerIndex;
+
+  // 关键修复：合并状态而不是直接覆盖。
+  // 发送方本地副本里其他玩家的 hand 已被过滤成 []（防偷看），
+  // 如果直接存，会导致其他玩家手牌"蒸发"。
+  // 正确做法：出牌者自己的手牌以发送方为准，其他玩家手牌以服务器存档为准。
   if (msg.gameState) {
-    room.gameState = msg.gameState;
+    const incoming = msg.gameState;
+    const prev = room.gameState;
+    const merged = { ...incoming };
+    merged.players = incoming.players.map((p, i) => {
+      if (i === senderIndex) return p; // 发送方自己的手牌是最新的
+      const serverP = prev && prev.players && prev.players[i];
+      return { ...p, hand: serverP ? serverP.hand : p.hand };
+    });
+    room.gameState = merged;
   }
-  
-  // 广播给其他玩家
-  broadcastToRoom(msg.roomCode, {
-    type: 'action',
-    action: msg.action,
-    gameState: msg.gameState
-  }, ws);
+
+  // 按玩家视角过滤后再广播，避免泄露其他玩家手牌
+  room.players.forEach((p, idx) => {
+    if (!p.ws || p.ws.readyState !== WebSocket.OPEN) return;
+    if (p.ws === ws) return; // 发送方自己保留本地最新状态
+    p.ws.send(JSON.stringify({
+      type: 'action',
+      action: msg.action,
+      gameState: buildPlayerViewOfGameState(room.gameState, idx)
+    }));
+  });
 }
 
 // 处理动画消息 - 广播给房间所有玩家
@@ -471,24 +515,23 @@ function handleDogDefense(ws, msg) {
   }
 }
 
-// 关键修复：处理游戏结束，广播给所有玩家
+// 关键修复：处理游戏结束，按玩家视角广播给所有玩家
 function handleGameEnd(ws, msg) {
   const room = rooms.get(msg.roomCode);
   if (!room) return;
-  
+
   // 更新游戏状态
   if (msg.gameState) {
     room.gameState = msg.gameState;
   }
-  
-  // 广播给所有玩家（包括发送者）
-  room.players.forEach(p => {
-    if (p.ws.readyState === WebSocket.OPEN) {
-      p.ws.send(JSON.stringify({
-        type: 'gameEnd',
-        gameState: msg.gameState
-      }));
-    }
+
+  // 按视角广播给所有玩家（包括发送者）
+  room.players.forEach((p, idx) => {
+    if (!p.ws || p.ws.readyState !== WebSocket.OPEN) return;
+    p.ws.send(JSON.stringify({
+      type: 'gameEnd',
+      gameState: buildPlayerViewOfGameState(room.gameState, idx)
+    }));
   });
 }
 
@@ -509,33 +552,93 @@ function handleEmoji(ws, msg) {
   });
 }
 
+// 关键修复：断线重连。handleDisconnect 只标记断线时间，不立即删除玩家，
+// 给玩家 5 分钟重连窗口期，超时后才彻底清理。
+const DISCONNECT_TIMEOUT_MS = 5 * 60 * 1000;
+
+function handleReconnect(ws, msg) {
+  const room = rooms.get(msg.roomCode);
+  if (!room) {
+    ws.send(JSON.stringify({ type: 'error', message: '房间不存在或已关闭' }));
+    return;
+  }
+
+  const player = room.players.find(p => p.id === msg.playerId);
+  if (!player) {
+    ws.send(JSON.stringify({ type: 'error', message: '玩家身份不存在，请重新加入房间' }));
+    return;
+  }
+
+  // 恢复玩家连接
+  player.ws = ws;
+  player.disconnectedAt = null;
+  playerConnections.set(ws, { roomCode: msg.roomCode, playerId: player.id, playerIndex: room.players.indexOf(player) });
+
+  // 推送重连成功 + 当前状态（按视角过滤）
+  const playerIndex = room.players.indexOf(player);
+  ws.send(JSON.stringify({
+    type: 'reconnected',
+    roomCode: msg.roomCode,
+    playerId: player.id,
+    myPlayerIndex: playerIndex,
+    gameState: buildPlayerViewOfGameState(room.gameState, playerIndex)
+  }));
+
+  // 同时通知房间内其他玩家该玩家已重连
+  sendPlayerList(msg.roomCode);
+  console.log(`Player ${player.name} reconnected to room ${msg.roomCode}`);
+}
+
 function handleDisconnect(ws) {
   const conn = playerConnections.get(ws);
   if (!conn) return;
-  
+
   const room = rooms.get(conn.roomCode);
   if (room) {
-    // 移除玩家
-    room.players = room.players.filter(p => p.id !== conn.playerId);
-    
-    if (room.players.length === 0) {
-      // 房间空了，删除
-      rooms.delete(conn.roomCode);
-      console.log(`Room ${conn.roomCode} deleted (empty)`);
-    } else {
-      // 通知其他玩家
+    const player = room.players.find(p => p.id === conn.playerId);
+    if (player) {
+      // 标记为断线，但保留在玩家列表中（给重连窗口期）
+      player.ws = null;
+      player.disconnectedAt = Date.now();
+
+      // 如果房主断线，自动指定新房主（按列表顺序找第一个还在线的）
+      if (player.isHost) {
+        const newHost = room.players.find(p => p.id !== player.id && p.ws && p.ws.readyState === WebSocket.OPEN);
+        if (newHost) {
+          player.isHost = false;
+          newHost.isHost = true;
+        }
+      }
+
+      // 通知其他在线玩家该玩家已暂时离开
       sendPlayerList(conn.roomCode);
-      
-      // 如果房主离开，指定新房主
-      if (room.players[0] && !room.players[0].isHost) {
-        room.players[0].isHost = true;
-        sendPlayerList(conn.roomCode);
+
+      // 启动超时清理：5 分钟内不重连则彻底移除
+      setTimeout(() => {
+        const currentRoom = rooms.get(conn.roomCode);
+        if (!currentRoom) return;
+        const stillDown = currentRoom.players.find(p => p.id === conn.playerId);
+        if (stillDown && stillDown.disconnectedAt) {
+          currentRoom.players = currentRoom.players.filter(p => p.id !== conn.playerId);
+          if (currentRoom.players.length === 0) {
+            rooms.delete(conn.roomCode);
+            console.log(`Room ${conn.roomCode} deleted (empty after timeout)`);
+          } else {
+            sendPlayerList(conn.roomCode);
+          }
+          console.log(`Player ${conn.playerId} removed after timeout`);
+        }
+      }, DISCONNECT_TIMEOUT_MS);
+    } else {
+      // 玩家已不存在，直接清理房间
+      if (room.players.length === 0) {
+        rooms.delete(conn.roomCode);
       }
     }
   }
-  
+
   playerConnections.delete(ws);
-  console.log('Player disconnected');
+  console.log('Player disconnected (waiting for reconnect)');
 }
 
 // ==================== 启动服务器 ====================
